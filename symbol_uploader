@@ -1,0 +1,158 @@
+#!/usr/bin/env python
+
+"""
+Uploads Android or iOS debug symbols to Crittercism.
+http://docs.crittercism.com/android/android.html#uploading-symbols-using-the-api
+
+You need a valid OAuth2 auth token to post requests to the Crittercism API.
+http://docs.crittercism.com/api/api.html#getting-started
+
+This script depends on Requests:
+http://docs.python-requests.org/en/latest/user/install/#distribute-pip.
+$ pip install --user requests
+"""
+
+from __future__ import print_function
+
+import sys
+import json
+import os.path
+import argparse
+import logging
+
+try:
+    # pip install requests if you don't have it already. Add --user local user
+    import requests
+except ImportError:
+    print('You need the requests package. Run "pip install --user requests"'
+          ' to install it.')
+    sys.exit(1)
+
+
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig()
+# LOGGER.setLevel(logging.DEBUG)
+
+
+class Uploader(object):
+
+    """Uploads debug symbols to Crittercism."""
+
+    def __init__(self, token, app_id, filename):
+        self.token = token
+        self.app_id = app_id
+        self.scope = 'app/{0}/symbols'.format(self.app_id)
+        self.filename = filename
+        self.file_resource = None
+        self.header = {'Authorization': 'Bearer {0}'.format(self.token)}
+        self.base_symbol_upload_url = 'https://files.crittercism.com/api/v1'
+
+    def upload(self):
+        """Performs the upload."""
+        self.create_new_file_resource()
+        self.fill_file_resource()
+        self.create_symbol_upload_job()
+
+    def create_new_file_resource(self):
+        """Creates a new Crittercism file resource.
+
+        curl -X POST https://files.crittercism.com/api/v1/applications/{appId}/symbol-uploads \
+            -H 'Authorization: Bearer <token>'
+
+        Response:
+        {
+            "resource-id" : "d6a11f25-600e-4b39-98b8-f4a5488e42a4",
+            "last-modified" : "2015-08-06T22:27:49.338Z",
+            "size" : "0",
+            "md5sum" : "",
+            "storage-bucket" : "crittercism-files-prod",
+            "storage-key" : "applications/519d53101386202089000007/symbol-uploads/69bc3a50-90ee-3fc7-9ecw-a966aac20520",
+            "status" : "empty",
+            "appid" : "519d53101386202089000007",
+            "filename" : "",
+            "created" : "2015-08-06T22:27:49.338Z",
+            "resource-type" : "symbol-uploads"
+        }
+        """
+        url = '{0}/applications/{1}/symbol-uploads'
+        url = url.format(self.base_symbol_upload_url, self.app_id)
+
+        print('Requesting new file resource from', url)
+        response = requests.post(url, headers=self.header)
+        LOGGER.debug('response.text: %s', response.text)
+
+        response.raise_for_status()
+        self.file_resource_response = response.json()
+        print('File resource (id:{0}) ready for upload'.format(
+            self.file_resource_response['resource-id']))
+
+    def fill_file_resource(self):
+        """Fills the given file resource, identified by UUID.
+
+        curl -X PUT https://files.crittercism.com/api/v1/applications/{appId}/symbol-uploads/d6a11f25-600e-4b39-98b8-f4a5488e42a4 \
+            -F name=symbolUpload -F "filedata=@/Users/dalbrecht/Downloads/appSymbols.tar.bz2" \
+            -H 'Authorization: Bearer <token>'
+        """
+        # token, resource_id, app_id, file_path
+        payload = {'name': 'symbolUpload'}
+        files = {'filedata': open(self.filename, 'rb')}
+        url = '{0}/{1}'.format(self.base_symbol_upload_url,
+                               self.file_resource_response['storage-key'])
+
+        print('Uploading', self.filename, 'to', url)
+        response = requests.put(url, headers=self.header, files=files)
+        response.raise_for_status()
+        print('Upload complete')
+
+    def create_symbol_upload_job(self):
+        """Creates a job request to process the uploaded symbols identified by the given UUID.
+
+        curl -X POST https://app.crittercism.com/v1.0/app/{appId}/symbols/uploads \
+        -d '{"uploadUuid": "d6a11f25-600e-4b39-98b8-f4a5488e42a4","filename":"appSymbols.tar.bz2"}' \
+        -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json'
+
+        Response:
+        {
+            "completionStatus" : "NOT_STARTED",
+            "uploadedResourceUuid" : "d6a11f25-600e-4b39-98b8-f4a5488e42a4",
+            "symbolType" : "DSYM",
+            "appId" : "519d53101386202089000007",
+            "createdAt" : "2015-08-06T22:36:13+00:00",
+            "uploadedFilename" : "appSymbols.tar.bz2"
+        }
+        """
+        url = 'https://app.crittercism.com/v1.0/app/{0}/symbols/uploads'
+        url = url.format(self.app_id)
+        print('Requesting symbol upload job at', url)
+
+        headers = self.header
+        headers['Content-Type'] = 'application/json'
+        payload = {"uploadUuid": self.file_resource_response['resource-id'],
+                   "filename": os.path.basename(self.filename)}
+
+        LOGGER.debug('headers: %s - payload: %s', str(headers), str(payload))
+        response = requests.post(url, headers=headers,
+                                 data=json.dumps(payload))
+        LOGGER.debug('response.text: %s', response.text)
+
+        response.raise_for_status()
+        self.upload_job_response = response.json()
+        print('Done')
+
+
+def main(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-t', '--token', help='access token used to authorize the requests sent to the Crittercism API. '
+                        'Follow the instructions at http://docs.crittercism.com/api/api.html#api-oauth2-access-token to issue a token.')
+    parser.add_argument(
+        '-a', '--app_id', help='application ID of the symbol being uploaded.')
+    parser.add_argument(
+        '-f', '--file', help='path to compressed debug symbols to upload.')
+    opts = parser.parse_args(args)
+
+    uploader = Uploader(opts.token, opts.app_id, opts.file)
+    uploader.upload()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
